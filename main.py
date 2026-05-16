@@ -1,21 +1,25 @@
 from flask import Flask, request, jsonify
-import alpaca_trade_api as tradeapi
 import os
 import threading
 import time
 import datetime
 import pytz
+from pybit.unified_trading import HTTP
 
 app = Flask(__name__)
 
-API_KEY    = os.environ.get('ALPACA_API_KEY')
-SECRET_KEY = os.environ.get('ALPACA_SECRET_KEY')
-BASE_URL   = 'https://paper-api.alpaca.markets'
+# 바이비트 테스트넷 설정
+API_KEY    = os.environ.get('BYBIT_API_KEY')
+SECRET_KEY = os.environ.get('BYBIT_SECRET_KEY')
 
-api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL)
+session = HTTP(
+    testnet=True,
+    api_key=API_KEY,
+    api_secret=SECRET_KEY
+)
 
-INITIAL_SEED = 100000  # ✅ 본인 시드로 변경
-BUY_PERCENT  = 5
+INITIAL_SEED = 10000  # ✅ 테스트넷 시드 금액 (USDT)
+BUY_PERCENT  = 5      # 시드의 5% 매수
 
 positions = {}
 
@@ -30,32 +34,35 @@ def webhook():
         return jsonify({'error': 'No data'}), 400
 
     action     = data.get('action')
-    ticker     = data.get('ticker')
+    ticker     = data.get('ticker', 'BTCUSDT')
     stop_price = data.get('stop_price')
 
     try:
         if action == 'BUY':
-            bars  = api.get_latest_bar(ticker)
-            price = bars.c
+            # 현재 가격 조회
+            result = session.get_tickers(category="spot", symbol=ticker)
+            price  = float(result['result']['list'][0]['lastPrice'])
 
+            # 시드의 5% 매수
             amount = INITIAL_SEED * (BUY_PERCENT / 100)
-            qty    = int(amount / price)
+            qty    = round(amount / price, 6)
 
-            if qty < 1:
-                return jsonify({'error': '잔액 부족'}), 400
+            if qty <= 0:
+                return jsonify({'error': '수량 부족'}), 400
 
-            api.submit_order(
+            # 매수 주문
+            session.place_order(
+                category="spot",
                 symbol=ticker,
-                qty=qty,
-                side='buy',
-                type='market',
-                time_in_force='gtc'
+                side="Buy",
+                orderType="Market",
+                qty=str(qty)
             )
 
             positions[ticker] = {
-                'qty':         qty,
+                'qty':        qty,
                 'entry_price': price,
-                'stop_price':  float(stop_price) if stop_price else None
+                'stop_price': float(stop_price) if stop_price else None
             }
 
             return jsonify({
@@ -67,24 +74,33 @@ def webhook():
             })
 
         elif action == 'SELL':
-            try:
-                position = api.get_position(ticker)
-                qty      = int(float(position.qty))
-            except:
-                return jsonify({'error': '보유 주식 없음'}), 400
+            # 보유 수량 조회
+            result = session.get_wallet_balance(accountType="UNIFIED")
+            coins  = result['result']['list'][0]['coin']
+            symbol = ticker.replace('USDT', '')
+            qty    = 0
 
-            api.submit_order(
+            for coin in coins:
+                if coin['coin'] == symbol:
+                    qty = float(coin['walletBalance'])
+                    break
+
+            if qty <= 0:
+                return jsonify({'error': '보유 코인 없음'}), 400
+
+            # 매도 주문
+            session.place_order(
+                category="spot",
                 symbol=ticker,
-                qty=qty,
-                side='sell',
-                type='market',
-                time_in_force='gtc'
+                side="Sell",
+                orderType="Market",
+                qty=str(round(qty, 6))
             )
 
             if ticker in positions:
                 del positions[ticker]
 
-            return jsonify({'status': 'SELL 익절 완료', 'ticker': ticker, 'qty': qty})
+            return jsonify({'status': 'SELL 완료', 'ticker': ticker, 'qty': qty})
 
         else:
             return jsonify({'error': '알 수 없는 action'}), 400
@@ -93,40 +109,44 @@ def webhook():
         return jsonify({'error': str(e)}), 500
 
 
+# 손절 체크
 def check_stoploss():
     while True:
         try:
-            et  = pytz.timezone('America/New_York')
-            now = datetime.datetime.now(et)
+            for ticker, info in list(positions.items()):
+                stop_price = info.get('stop_price')
+                if not stop_price:
+                    continue
 
-            # 장 마감 후 16:05 ~ 16:10 에만 체크
-            if now.hour == 16 and 5 <= now.minute <= 10:
-                for ticker, info in list(positions.items()):
-                    stop_price = info.get('stop_price')
-                    if not stop_price:
-                        continue
+                # 현재 가격 조회
+                result = session.get_tickers(category="spot", symbol=ticker)
+                price  = float(result['result']['list'][0]['lastPrice'])
 
-                    bars  = api.get_latest_bar(ticker)
-                    close = bars.c
+                if price < stop_price:
+                    try:
+                        symbol = ticker.replace('USDT', '')
+                        result2 = session.get_wallet_balance(accountType="UNIFIED")
+                        coins   = result2['result']['list'][0]['coin']
+                        qty     = 0
 
-                    if close < stop_price:
-                        try:
-                            position = api.get_position(ticker)
-                            qty      = int(float(position.qty))
+                        for coin in coins:
+                            if coin['coin'] == symbol:
+                                qty = float(coin['walletBalance'])
+                                break
 
-                            api.submit_order(
+                        if qty > 0:
+                            session.place_order(
+                                category="spot",
                                 symbol=ticker,
-                                qty=qty,
-                                side='sell',
-                                type='market',
-                                time_in_force='gtc'
+                                side="Sell",
+                                orderType="Market",
+                                qty=str(round(qty, 6))
                             )
-
                             del positions[ticker]
-                            print(f"{ticker} 손절! 종가 {close} < 손절선 {stop_price}")
+                            print(f"{ticker} 손절! 현재가 {price} < 손절선 {stop_price}")
 
-                        except Exception as e:
-                            print(f"손절 실패: {e}")
+                    except Exception as e:
+                        print(f"손절 실패: {e}")
 
         except Exception as e:
             print(f"오류: {e}")
